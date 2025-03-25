@@ -5,3 +5,7 @@ __pycache__
 202*/
 client_*.json
 *.txt
+*.json
+*.pickle
+*.yaml
+*.yml

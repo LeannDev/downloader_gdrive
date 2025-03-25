@@ -1,96 +1,176 @@
 import os
+import pickle
 import subprocess
-from decouple import config, Csv
-from datetime import datetime
-from pydrive2.drive import GoogleDrive
-from auth import authenticate_headless, complete_authentication
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
-def main():
-    # 1. Autenticación y conexión a Google Drive usando funciones de auth.py
-    # 1. Autenticación y conexión a Google Drive usando funciones de auth.py
-    gauth, _ = authenticate_headless()  # Ya no necesitamos auth_url ni auth_code
-    drive = GoogleDrive(gauth)
+# Si modificas estos scopes, borra el archivo token.pickle.
+SCOPES = ['https://www.googleapis.com/auth/drive']
 
-    # 2. Especifica la ID de la carpeta en Google Drive que contiene los videos (raíz en este caso)
-    folder_id = 'root'
+# folder path
+DOWNLOADS_PATH = "downloads/videos"
+CONVERTED_PATH = "downloads/converted"
 
-    # 3. Define la ruta local donde se descargarán los videos
-    today = datetime.today()
-    download_folder = 'videos/downloads'
-    if not os.path.exists(download_folder):
-        os.makedirs(download_folder)
+# delete files
+DELETE_DOWNLOADED_VIDEOS = True # local files
+DELETE_DRIVE_VIDEOS = True # drive files
 
-    # 4. Define la ruta para guardar los videos convertidos a 480p
-    videos_480p_folder = today.strftime("%Y/%m/%d")
-    if not os.path.exists(videos_480p_folder):
-        os.makedirs(videos_480p_folder)
+def authenticate_google_drive():
+    creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                'credentials.json',
+                scopes=SCOPES,
+                redirect_uri='http://localhost'  # Usa el mismo redirect_uri que está en credentials.json
+            )
+            # Genera la URL de autorización y la imprime en la consola
+            auth_url, _ = flow.authorization_url(prompt='consent')
+            print('Por favor, visita la siguiente URL para autorizar la aplicación:')
+            print(auth_url)
+            print('\nDespués de autorizar, copia el código de autorización y péguelo aquí.')
 
-    # 5. Lista los archivos en la carpeta de Drive (en la raíz)
-    file_list = drive.ListFile({
-        'q': f"'{folder_id}' in parents and trashed=false"
-    }).GetList()
+            # Solicita el código de autorización manualmente
+            auth_code = input('Ingresa el código de autorización: ')
+            # Intercambia el código de autorización por un token de acceso
+            flow.fetch_token(code=auth_code)
+            creds = flow.credentials
 
-    # 6. Procesa cada archivo: descarga, convierte a 480p y elimina el archivo original localmente
-    for file in file_list:
-        file_title = file['title']
-        
-        # Verifica que el archivo sea .mp4
-        if not file_title.lower().endswith('.mp4'):
-            print(f"Saltando {file_title} (no es un archivo .mp4)")
-            continue
+            # Guarda las credenciales para futuras ejecuciones
+            with open('token.pickle', 'wb') as token:
+                pickle.dump(creds, token)
+    return creds
 
-        # Prepara el nombre y la ruta para el video convertido
-        name, ext = os.path.splitext(file_title)
-        converted_file_name = f"{name}_480p{ext}"
-        converted_path = os.path.join(videos_480p_folder, converted_file_name)
+def list_mp4_files(service):
+    results = service.files().list(
+        q="mimeType='video/mp4'",
+        pageSize=10, fields="nextPageToken, files(id, name)").execute()
+    items = results.get('files', [])
+    return items
 
-        # Si ya existe el video convertido, se salta el procesamiento
-        if os.path.exists(converted_path):
-            print(f"Saltando {file_title} porque {converted_path} ya existe.")
-            continue
+def get_unique_filename(download_path, file_name):
+    # Verifica si el archivo ya existe
+    full_path = os.path.join(download_path, file_name)
+    if not os.path.exists(full_path):
+        return full_path
+    
+    # Si existe, agrega un sufijo único
+    base_name, ext = os.path.splitext(file_name)
+    counter = 1
+    while True:
+        new_name = f"{base_name}_{counter}{ext}"
+        new_path = os.path.join(download_path, new_name)
+        if not os.path.exists(new_path):
+            return new_path
+        counter += 1
 
-        print(f"Procesando: {file_title}")
-        local_path = os.path.join(download_folder, file_title)
-        
-        try:
-            # Descarga el archivo a la carpeta de descargas
-            file.GetContentFile(local_path)
-            if os.path.exists(local_path):
-                print(f"Descargado: {local_path}")
+def download_file(service, file_id, file_name, download_path):
+    # Obtiene un nombre de archivo único
+    full_path = get_unique_filename(download_path, file_name)
+    
+    try:
+        # Descarga el archivo
+        request = service.files().get_media(fileId=file_id)
+        with open(full_path, 'wb') as f:
+            downloader = MediaIoBaseDownload(f, request)
+            done = False
+            while done is False:
+                status, done = downloader.next_chunk()
+                print(f"Download {int(status.progress() * 100)}%.")
+        print(f"Archivo guardado en: {full_path}")
+        return full_path
+    except Exception as e:
+        print(f"Error al descargar {file_name}: {e}")
+        return None
+
+def convert_to_480p(input_path, output_folder):
+    # Crea la carpeta de salida si no existe
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+        print(f"Carpeta de conversión creada: {output_folder}")
+
+    # Crea la ruta de salida para el video convertido
+    file_name = os.path.basename(input_path)
+    output_path = os.path.join(output_folder, os.path.splitext(file_name)[0] + "_480p.mp4")
+    
+    # Comando de ffmpeg para convertir a 480p
+    command = [
+        'ffmpeg',
+        '-i', input_path,          # Archivo de entrada
+        '-vf', 'scale=854:480',   # Escala a 480p (854x480)
+        '-c:a', 'copy',           # Copia el audio sin cambios
+        output_path               # Archivo de salida
+    ]
+    
+    # Ejecuta el comando
+    try:
+        subprocess.run(command, check=True)
+        print(f"Video convertido a 480p: {output_path}")
+        return output_path
+    except subprocess.CalledProcessError as e:
+        print(f"Error al convertir el video: {e}")
+        return None
+
+def delete_file(service, file_id):
+    service.files().delete(fileId=file_id).execute()
+    print(f"File {file_id} deleted.")
+
+def main(download_path, converted_path):
+    # Verifica si la carpeta de descarga existe, si no, la crea
+    if not os.path.exists(download_path):
+        os.makedirs(download_path)
+        print(f"Carpeta de descarga creada: {download_path}")
+
+    # Verifica si la carpeta de videos convertidos existe, si no, la crea
+    if not os.path.exists(converted_path):
+        os.makedirs(converted_path)
+        print(f"Carpeta de videos convertidos creada: {converted_path}")
+
+    creds = authenticate_google_drive()
+    service = build('drive', 'v3', credentials=creds)
+
+    mp4_files = list_mp4_files(service)
+    if not mp4_files:
+        print('No MP4 files found.')
+    else:
+        for item in mp4_files:
+            file_id = item['id']
+            file_name = item['name']
+            print(f'Downloading {file_name}...')
+            downloaded_path = download_file(service, file_id, file_name, download_path)
+            if downloaded_path:
+                print(f'{file_name} downloaded.')
                 
-                # Ejecuta ffmpeg para convertir el video a 480p, manteniendo la relación de aspecto
-                command = [
-                    'ffmpeg', '-i', local_path,
-                    '-vf', 'scale=-2:480',
-                    '-c:a', 'copy',
-                    converted_path
-                ]
-                print(f"Convirtiendo {file_title} a 480p...")
-                result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                # Convertir el video a 480p
+                converted_path_output = convert_to_480p(downloaded_path, converted_path)
+                if converted_path_output:
+                    print(f'{file_name} convertido a 480p: {converted_path_output}')
+                    
+                    if DELETE_DOWNLOADED_VIDEOS:
+                        # Eliminar el video original después de la conversión
+                        os.remove(downloaded_path)
+                        print(f'Video original eliminado: {downloaded_path}')
                 
-                if result.returncode == 0:
-                    print(f"Conversión exitosa: {converted_path}")
-                    
-                    # Elimina el archivo original descargado de la carpeta local
-                    try:
-                        os.remove(local_path)
-                        print(f"Eliminado del directorio local: {local_path}")
-                    except Exception as e:
-                        print(f"Error al eliminar el archivo local {local_path}: {e}")
-                    
-                    # Si se requiere eliminar también de Google Drive, se puede descomentar:
-                    #try:
-                    #    file.Delete()
-                    #    print(f"Eliminado de Google Drive: {file_title}")
-                    #except Exception as e:
-                    #    print(f"Error al eliminar de Drive {file_title}: {e}")
-                else:
-                    error_message = result.stderr.decode()
-                    print(f"Error en la conversión de {file_title}: {error_message}")
+                if DELETE_DRIVE_VIDEOS:
+                    # delete from drive
+                    delete_file(service, file_id)
+                    print(f'{file_name} deleted from Google Drive.')
+
             else:
-                print(f"Error: El archivo {file_title} no se descargó correctamente.")
-        except Exception as e:
-            print(f"Excepción al procesar {file_title}: {str(e)}")
+                print(f'Error: No se pudo descargar {file_name}.')
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    # Especifica las rutas para los videos descargados y convertidos
+    download_folder = DOWNLOADS_PATH  # Cambia esto por la ruta que desees
+    converted_folder = CONVERTED_PATH  # Cambia esto por la ruta que desees
+    
+    # Ejecuta el script
+    main(download_folder, converted_folder)
