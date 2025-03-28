@@ -1,61 +1,62 @@
 import os
 import pickle
 import subprocess
+from datetime import datetime
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-# Si modificas estos scopes, borra el archivo token.pickle.
+# Scopes
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
-# Ruta base absoluta (donde está ubicado este script)
+# Ruta base
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Rutas absolutas
-CREDENTIALS_PATH = os.path.join(BASE_DIR, 'credentials.json')
-TOKEN_PATH = os.path.join(BASE_DIR, 'token.pickle')
-DOWNLOADS_PATH = os.path.join(BASE_DIR, 'downloads', 'videos')
-CONVERTED_PATH = os.path.join(BASE_DIR, 'downloads', 'converted')
 LOG_PATH = os.path.join(BASE_DIR, 'logs', 'gdrive.log')
 
-# delete files
-DELETE_DOWNLOADED_VIDEOS = True  # local files
-DELETE_DRIVE_VIDEOS = True       # drive files
+DELETE_DOWNLOADED_VIDEOS = True
+DELETE_DRIVE_VIDEOS = True
 
-# Log de ejecución
-try:
-    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-    with open(LOG_PATH, "a") as log:
-        log.write(">>> Script iniciado desde cron\n")
-except Exception as e:
-    print(f"Error al escribir en el log: {e}")
-
-def authenticate_google_drive():
+def authenticate_google_drive(account_id):
     creds = None
-    if os.path.exists(TOKEN_PATH):
-        with open(TOKEN_PATH, 'rb') as token:
+    token_path = os.path.join(BASE_DIR, f'token_{account_id}.pickle')
+    credentials_path = os.path.join(BASE_DIR, f'credentials_{account_id}.json')
+
+    if os.path.exists(token_path):
+        with open(token_path, 'rb') as token:
             creds = pickle.load(token)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(
-                CREDENTIALS_PATH,
+                credentials_path,
                 scopes=SCOPES,
                 redirect_uri='http://localhost'
             )
             auth_url, _ = flow.authorization_url(prompt='consent')
-            print('Por favor, visita la siguiente URL para autorizar la aplicación:')
+            print(f'[Cuenta {account_id}] Visita esta URL para autorizar:')
             print(auth_url)
-            print('\nDespués de autorizar, copia el código de autorización y péguelo aquí.')
-            auth_code = input('Ingresa el código de autorización: ')
+            auth_code = input('Pega el código de autorización aquí: ')
             flow.fetch_token(code=auth_code)
             creds = flow.credentials
-            with open(TOKEN_PATH, 'wb') as token:
+            with open(token_path, 'wb') as token:
                 pickle.dump(creds, token)
     return creds
+
+def get_dynamic_paths(account_id, date_ref):
+    year = str(date_ref.year)
+    month = f"{date_ref.month:02d}"
+    day = f"{date_ref.day:02d}"
+
+    videos_path = os.path.join(BASE_DIR, 'downloads', 'videos', account_id, year, month, day)
+    converted_path = os.path.join(BASE_DIR, 'downloads', 'converted', account_id, year, month, day)
+
+    os.makedirs(videos_path, exist_ok=True)
+    os.makedirs(converted_path, exist_ok=True)
+
+    return videos_path, converted_path
 
 def list_mp4_files(service):
     results = service.files().list(
@@ -95,7 +96,6 @@ def download_file(service, file_id, file_name, download_path):
 def convert_to_480p(input_path, output_folder):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
-        print(f"Carpeta de conversión creada: {output_folder}")
     file_name = os.path.basename(input_path)
     output_path = os.path.join(output_folder, os.path.splitext(file_name)[0] + "_480p.mp4")
     command = [
@@ -115,35 +115,56 @@ def convert_to_480p(input_path, output_folder):
 
 def delete_file(service, file_id):
     service.files().delete(fileId=file_id).execute()
-    print(f"File {file_id} deleted.")
+    print(f"Archivo {file_id} eliminado de Google Drive.")
 
-def main(download_path, converted_path):
-    os.makedirs(download_path, exist_ok=True)
-    os.makedirs(converted_path, exist_ok=True)
-    creds = authenticate_google_drive()
+def process_account(account_id):
+    print(f"\n=== Procesando cuenta: {account_id} ===")
+    
+    # Fijar la fecha UNA SOLA VEZ por cuenta
+    now = datetime.now()
+    downloads_path, converted_path = get_dynamic_paths(account_id, now)
+
+    creds = authenticate_google_drive(account_id)
     service = build('drive', 'v3', credentials=creds)
+
     mp4_files = list_mp4_files(service)
     if not mp4_files:
-        print('No MP4 files found.')
-    else:
-        for item in mp4_files:
-            file_id = item['id']
-            file_name = item['name']
-            print(f'Downloading {file_name}...')
-            downloaded_path = download_file(service, file_id, file_name, download_path)
-            if downloaded_path:
-                print(f'{file_name} downloaded.')
-                converted_path_output = convert_to_480p(downloaded_path, converted_path)
-                if converted_path_output:
-                    print(f'{file_name} convertido a 480p: {converted_path_output}')
-                    if DELETE_DOWNLOADED_VIDEOS:
-                        os.remove(downloaded_path)
-                        print(f'Video original eliminado: {downloaded_path}')
-                if DELETE_DRIVE_VIDEOS:
-                    delete_file(service, file_id)
-                    print(f'{file_name} deleted from Google Drive.')
-            else:
-                print(f'Error: No se pudo descargar {file_name}.')
+        print('No se encontraron archivos MP4.')
+        return
+
+    for item in mp4_files:
+        file_id = item['id']
+        file_name = item['name']
+        print(f'Descargando {file_name}...')
+        downloaded_path = download_file(service, file_id, file_name, downloads_path)
+        if downloaded_path:
+            converted = convert_to_480p(downloaded_path, converted_path)
+            if converted and DELETE_DOWNLOADED_VIDEOS:
+                os.remove(downloaded_path)
+            if DELETE_DRIVE_VIDEOS:
+                delete_file(service, file_id)
+
+def main():
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        with open(LOG_PATH, "a") as log:
+            log.write(">>> Script iniciado\n")
+    except Exception as e:
+        print(f"Error al escribir en el log: {e}")
+
+    # Lista de cuentas
+    cuentas = [
+        'ciifa.faa@gmail.com',
+        'leanenueva@gmail.com',
+        # Agrega más cuentas aquí
+    ]
+
+    for cuenta in cuentas:
+        try:
+            process_account(cuenta)
+        except Exception as e:
+            print(f"Error procesando {cuenta}: {e}")
 
 if __name__ == '__main__':
-    main(DOWNLOADS_PATH, CONVERTED_PATH)
+    main()
+

@@ -9,3 +9,4 @@ client_*.json
 *.pickle
 *.yaml
 *.yml
+logs/*
